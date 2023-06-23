@@ -787,7 +787,7 @@ class StackT5ForConditionalGeneration(StackT5PreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
         self.transformer = StackT5Model(config)
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=True)
 
         # Initialize weights and apply final processing
         self.post_init()
