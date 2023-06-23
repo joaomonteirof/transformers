@@ -37,9 +37,6 @@
 # https://github.com/bigcode-project/transformers/blob/main/src/transformers/models/megatron_gpt_bigcode/convert_megatron_gpt_bigcode_checkpoint.py
 
 
-import sys
-sys.path.append("/mnt/home/transformers")
-
 import argparse
 import os
 import re
