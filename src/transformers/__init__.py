@@ -469,6 +469,7 @@ _import_structure = {
     ],
     "models.splinter": ["SPLINTER_PRETRAINED_CONFIG_ARCHIVE_MAP", "SplinterConfig", "SplinterTokenizer"],
     "models.squeezebert": ["SQUEEZEBERT_PRETRAINED_CONFIG_ARCHIVE_MAP", "SqueezeBertConfig", "SqueezeBertTokenizer"],
+    "models.stackt5": ["STACKT5_PRETRAINED_CONFIG_ARCHIVE_MAP", "StackT5Config"],
     "models.swiftformer": ["SWIFTFORMER_PRETRAINED_CONFIG_ARCHIVE_MAP", "SwiftFormerConfig"],
     "models.swin": ["SWIN_PRETRAINED_CONFIG_ARCHIVE_MAP", "SwinConfig"],
     "models.swin2sr": ["SWIN2SR_PRETRAINED_CONFIG_ARCHIVE_MAP", "Swin2SRConfig"],
@@ -2489,6 +2490,14 @@ else:
             "SqueezeBertPreTrainedModel",
         ]
     )
+    _import_structure["models.stackt5"].extend(
+        [
+            "STACKT5_PRETRAINED_MODEL_ARCHIVE_LIST",
+            "StackT5ForConditionalGeneration",
+            "StackT5Model",
+            "StackT5PreTrainedModel",
+        ]
+    )
     _import_structure["models.swiftformer"].extend(
         [
             "SWIFTFORMER_PRETRAINED_MODEL_ARCHIVE_LIST",
@@ -4277,6 +4286,7 @@ if TYPE_CHECKING:
     )
     from .models.splinter import SPLINTER_PRETRAINED_CONFIG_ARCHIVE_MAP, SplinterConfig, SplinterTokenizer
     from .models.squeezebert import SQUEEZEBERT_PRETRAINED_CONFIG_ARCHIVE_MAP, SqueezeBertConfig, SqueezeBertTokenizer
+    from .models.stackt5 import STACKT5_PRETRAINED_CONFIG_ARCHIVE_MAP, StackT5Config
     from .models.swiftformer import SWIFTFORMER_PRETRAINED_CONFIG_ARCHIVE_MAP, SwiftFormerConfig
     from .models.swin import SWIN_PRETRAINED_CONFIG_ARCHIVE_MAP, SwinConfig
     from .models.swin2sr import SWIN2SR_PRETRAINED_CONFIG_ARCHIVE_MAP, Swin2SRConfig
@@ -6001,6 +6011,12 @@ if TYPE_CHECKING:
             T5Model,
             T5PreTrainedModel,
             load_tf_weights_in_t5,
+        )
+        from .models.stackt5 import (
+            STACKT5_PRETRAINED_MODEL_ARCHIVE_LIST,
+            StackT5ForConditionalGeneration,
+            StackT5Model,
+            StackT5PreTrainedModel,
         )
         from .models.table_transformer import (
             TABLE_TRANSFORMER_PRETRAINED_MODEL_ARCHIVE_LIST,
