@@ -98,6 +98,7 @@ class StackT5Config(PretrainedConfig):
         attention_softmax_in_fp32=True,
         scale_attention_softmax_in_fp32=True,
         multi_query=True,
+        is_encoder_decoder=True,
         **kwargs,
     ):
 
@@ -124,8 +125,14 @@ class StackT5Config(PretrainedConfig):
         self.bos_token_id = bos_token_id
         self.eos_token_id = eos_token_id
         self.pad_token_id = pad_token_id
+        self.is_encoder_decoder = is_encoder_decoder
 
-        super().__init__(bos_token_id=bos_token_id, eos_token_id=eos_token_id, pad_token_id = pad_token_id, **kwargs)
+        super().__init__(
+            bos_token_id=bos_token_id, 
+            eos_token_id=eos_token_id, 
+            pad_token_id = pad_token_id, 
+            is_encoder_decoder = is_encoder_decoder, 
+            **kwargs)
 
 
 

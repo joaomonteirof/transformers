@@ -28,7 +28,7 @@ from torch.utils.checkpoint import checkpoint
 
 from ...activations import ACT2FN
 from ...modeling_outputs import (
-    BaseModelOutput,
+    BaseModelOutputWithPastAndCrossAttentions,
     Seq2SeqLMOutput,
     Seq2SeqModelOutput,
 )
@@ -130,7 +130,7 @@ class StackT5Attention(nn.Module):
         if self.scale_attn_weights:
             scale_factor /= self.kv_channels**0.5
 
-        # MQA models: (batch_size, query_length, num_heads * head_dim)
+        # MQA models: (batch_size, query_length, num_heads * kv_channels)
         query_shape = query.shape
         batch_size = query_shape[0]
         key_length = key.size(-1)
@@ -178,20 +178,11 @@ class StackT5Attention(nn.Module):
                 head_mask = head_mask.transpose(1, 2)
             attn_weights = attn_weights * head_mask
 
-        if self.multi_query:
-            attn_output = torch.bmm(attn_weights.view(attn_view), value).view(query_shape)
-        else:
-            attn_output = torch.matmul(attn_weights, value)
+        attn_output = torch.bmm(attn_weights.view(attn_view), value).view(query_shape)
 
         return attn_output, attn_weights
 
-    def _split_heads(self, tensor, num_heads, attn_head_size):
-        """
-        Splits hidden_size dim into attn_head_size and num_heads
-        """
-        new_shape = tensor.size()[:-1] + (num_heads, attn_head_size)
-        tensor = tensor.view(new_shape)
-        return tensor.permute(0, 2, 1, 3)
+    
 
     def forward(
         self,
@@ -222,8 +213,6 @@ class StackT5Attention(nn.Module):
 
         attn_output, attn_weights = self._attn(query, key.transpose(-1, -2), value, attention_mask, head_mask)
 
-        if not self.multi_query:
-            attn_output = attn_output.transpose(1, 2).reshape(hidden_states.shape)
         attn_output = self.c_proj(attn_output)
         attn_output = self.resid_dropout(attn_output)
 
@@ -235,6 +224,7 @@ class StackT5Attention(nn.Module):
             outputs += (attn_weights,)
 
         return outputs  # a, present, (attentions)
+
 
 
 # Adapted from transformers.models.gpt_bicode.modeling_gpt_bigcode
@@ -278,6 +268,7 @@ class StackT5Block(nn.Module):
         layer_past: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         head_mask: Optional[torch.Tensor] = None,
+        cross_attn_head_mask: Optional[torch.Tensor] = None,
         encoder_hidden_states: Optional[torch.Tensor] = None,
         encoder_attention_mask: Optional[torch.Tensor] = None,
         use_cache: Optional[bool] = False,
@@ -305,8 +296,8 @@ class StackT5Block(nn.Module):
             hidden_states = self.ln_cross_attn(hidden_states)
             cross_attn_outputs = self.crossattention(
                 hidden_states,
-                attention_mask=attention_mask,
-                head_mask=head_mask,
+                attention_mask=None,
+                head_mask=cross_attn_head_mask,
                 encoder_hidden_states=encoder_hidden_states,
                 encoder_attention_mask=encoder_attention_mask,
                 output_attentions=output_attentions,
@@ -519,27 +510,24 @@ class StackT5Model(StackT5PreTrainedModel):
 
     def set_input_embeddings(self, new_embeddings):
         self.wte = new_embeddings
+    
+    def encoder_forward(
+            self,
+            input_ids: Optional[torch.Tensor] = None,
+            attention_mask: Optional[torch.Tensor] = None,
+            head_mask: Optional[torch.Tensor] = None,
+            inputs_embeds: Optional[torch.Tensor] = None,
+            output_attentions: Optional[bool] = None,
+            output_hidden_states: Optional[bool] = None,
+            return_dict: Optional[bool] = None,
+            ) -> Union[Tuple, BaseModelOutputWithPastAndCrossAttentions]:  
 
-    @add_start_docstrings_to_model_forward(STACKT5_INPUTS_DOCSTRING)
-    def forward(
-        self,
-        input_ids: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        decoder_input_ids: Optional[torch.Tensor] = None,
-        decoder_attention_mask: Optional[torch.Tensor] = None,
-        past_key_values: Optional[List[torch.Tensor]] = None,
-        head_mask: Optional[torch.Tensor] = None,
-        inputs_embeds: Optional[torch.Tensor] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-    ) -> Union[Tuple, Seq2SeqModelOutput]:
+        use_cache = False
+        
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
-        use_cache = use_cache if use_cache is not None else self.config.use_cache
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         if input_ids is not None and inputs_embeds is not None:
@@ -554,19 +542,7 @@ class StackT5Model(StackT5PreTrainedModel):
         else:
             raise ValueError("You have to specify either input_ids or inputs_embeds")
 
-        decoder_input_shape = decoder_input_ids.size()
-        decoder_input_ids = decoder_input_ids.view(-1, decoder_input_shape[-1])
-
-        if batch_size <= 0:
-            raise ValueError("batch_size has to be defined and > 0")
-
         device = input_ids.device if input_ids is not None else inputs_embeds.device
-
-        if past_key_values is None:
-            past_length = 0
-            past_key_values = tuple([None] * len(self.decoder))
-        else:
-            past_length = past_key_values[0].size(-2)
 
         if attention_mask is not None and len(attention_mask.shape) == 2:
             # create position_ids on the fly for batch generation
@@ -576,20 +552,9 @@ class StackT5Model(StackT5PreTrainedModel):
             position_ids = torch.arange(input_shape[-1], dtype=torch.long, device=device)
             position_ids = position_ids.unsqueeze(0).view(-1, input_shape[-1])
 
-        if decoder_attention_mask is not None and len(decoder_attention_mask.shape) == 2:
-            # create position_ids on the fly for batch generation
-            decoder_position_ids = decoder_attention_mask.long().cumsum(-1) - 1
-            decoder_position_ids.masked_fill_(decoder_attention_mask == 0, 1)
-            if past_length > 0:
-                decoder_position_ids = decoder_position_ids[:, past_length : input_shape[-1] + past_length :]
-        else:
-            decoder_position_ids = torch.arange(past_length, decoder_input_shape[-1] + past_length, dtype=torch.long, device=device)
-            decoder_position_ids = decoder_position_ids.unsqueeze(0).view(-1, decoder_input_shape[-1])
-
 
         # Encoder self-attention mask and cross-attention mask.
         query_length = input_shape[-1]
-        key_length = past_length + query_length
         self_attention_mask = self.bias[None, :query_length, :query_length]
 
         if attention_mask is not None:
@@ -597,29 +562,15 @@ class StackT5Model(StackT5PreTrainedModel):
                 dtype=torch.bool, device=self_attention_mask.device
             )
         
-        # Decoder self-attention mask.
-        decoder_query_length = decoder_input_shape[-1]
-        key_length = past_length + decoder_query_length
-        decoder_self_attention_mask = self.bias[None, key_length - decoder_query_length : key_length, :key_length]
-
-        if decoder_attention_mask is not None:
-            decoder_self_attention_mask = decoder_self_attention_mask * decoder_attention_mask.view(batch_size, 1, -1).to(
-                dtype=torch.bool, device=self_attention_mask.device
-            )
-
         # MQA models: (batch_size, query_length, n_heads, key_length)
         # MHA models: (batch_size, n_heads, query_length, key_length)
         attention_mask = self_attention_mask.unsqueeze(2 if self.multi_query else 1)
-        decoder_attention_mask = decoder_self_attention_mask.unsqueeze(2 if self.multi_query else 1)
 
         # Prepare head mask if needed
         # 1.0 in head_mask indicate we keep the head
         # attention_probs has shape bsz x n_heads x N x N
         # head_mask has shape n_layer x batch x n_heads x N x N
         encoder_head_mask = self.get_head_mask(head_mask, self.config.num_encoder_layers)
-        decoder_head_mask = self.get_head_mask(head_mask, self.config.num_decoder_layers)
-
-        # Encoder forward-pass
 
         if inputs_embeds is None:
             inputs_embeds = self.wte(input_ids)
@@ -632,7 +583,6 @@ class StackT5Model(StackT5PreTrainedModel):
 
         presents = [] if use_cache else None
         all_self_attentions = () if output_attentions else None
-        all_cross_attentions = () if output_attentions and self.config.add_cross_attention else None
         all_hidden_states = () if output_hidden_states else None
 
         for i, block in enumerate(self.encoder):
@@ -673,15 +623,140 @@ class StackT5Model(StackT5PreTrainedModel):
                 all_self_attentions = all_self_attentions + (outputs[2 if use_cache else 1],)
 
         hidden_states = self.encoder_ln_f(hidden_states)
-
         hidden_states = hidden_states.view(output_shape)
         # Add last hidden state
         if output_hidden_states:
-            all_hidden_states = all_hidden_states + (hidden_states,)
+            all_hidden_states = all_hidden_states + (hidden_states,)  
+
+        if return_dict is None or return_dict:
+            return BaseModelOutputWithPastAndCrossAttentions(
+                last_hidden_state=hidden_states,
+                past_key_values=None,
+                hidden_states=all_hidden_states,
+                attentions=all_self_attentions,
+                cross_attentions=None,
+            )
+
+        return tuple(
+            v
+            for v in [
+                hidden_states,
+                None,
+                all_hidden_states,
+                all_self_attentions,
+                None,
+            ]
+            if v is not None
+        )
+
+    def decoder_forward(
+            self,
+            input_ids: Optional[torch.Tensor] = None,
+            attention_mask: Optional[torch.Tensor] = None,
+            past_key_values: Optional[List[torch.Tensor]] = None,
+            encoder_hidden_states: Optional[Tuple[Tuple[torch.Tensor]]] = None,
+            encoder_attention_mask: Optional[Tuple[Tuple[torch.Tensor]]] = None,
+            head_mask: Optional[torch.Tensor] = None,
+            cross_attn_head_mask: Optional[torch.Tensor] = None,
+            inputs_embeds: Optional[torch.Tensor] = None,
+            use_cache: Optional[bool] = None,
+            output_attentions: Optional[bool] = None,
+            output_hidden_states: Optional[bool] = None,
+            return_dict: Optional[bool] = None,
+            ) -> Union[Tuple, BaseModelOutputWithPastAndCrossAttentions]:
         
-
-
         # Decoder forward-pass
+
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        if input_ids is not None and inputs_embeds is not None:
+            raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
+        elif input_ids is not None:
+            input_shape = input_ids.size()
+            input_ids = input_ids.view(-1, input_shape[-1])
+            batch_size = input_ids.shape[0]
+        elif inputs_embeds is not None:
+            input_shape = inputs_embeds.size()[:-1]
+            batch_size = inputs_embeds.shape[0]
+        else:
+            raise ValueError("You have to specify either input_ids or inputs_embeds")
+
+        
+        decoder_input_shape = input_ids.size()
+        decoder_input_ids = input_ids.view(-1, decoder_input_shape[-1])
+        decoder_inputs_embeds = inputs_embeds
+        decoder_attention_mask = attention_mask
+
+        if batch_size <= 0:
+            raise ValueError("batch_size has to be defined and > 0")
+
+        device = input_ids.device if input_ids is not None else inputs_embeds.device
+
+        if past_key_values is None:
+            past_length = 0
+            past_key_values = tuple([None] * len(self.decoder))
+        else:
+            past_length = past_key_values[0].size(-2)
+
+        if attention_mask is not None and len(attention_mask.shape) == 2:
+            # create position_ids on the fly for batch generation
+            position_ids = attention_mask.long().cumsum(-1) - 1
+            position_ids.masked_fill_(attention_mask == 0, 1)
+        else:
+            position_ids = torch.arange(input_shape[-1], dtype=torch.long, device=device)
+            position_ids = position_ids.unsqueeze(0).view(-1, input_shape[-1])
+
+        if decoder_attention_mask is not None and len(decoder_attention_mask.shape) == 2:
+            # create position_ids on the fly for batch generation
+            decoder_position_ids = decoder_attention_mask.long().cumsum(-1) - 1
+            decoder_position_ids.masked_fill_(decoder_attention_mask == 0, 1)
+            if past_length > 0:
+                decoder_position_ids = decoder_position_ids[:, past_length : input_shape[-1] + past_length :]
+        else:
+            decoder_position_ids = torch.arange(past_length, decoder_input_shape[-1] + past_length, dtype=torch.long, device=device)
+            decoder_position_ids = decoder_position_ids.unsqueeze(0).view(-1, decoder_input_shape[-1])
+
+        # Cross-attention mask.
+        encoder_input_length = encoder_hidden_states.size(1)
+        decoder_query_length = decoder_input_shape[-1]
+        cross_attention_mask = self.bias[None, :decoder_query_length, :encoder_input_length]
+
+        if encoder_attention_mask is not None:
+            cross_attention_mask = cross_attention_mask * encoder_attention_mask.view(batch_size, 1, -1).to(
+                dtype=torch.bool, device=cross_attention_mask.device
+            )
+        
+        # Decoder self-attention mask.
+        decoder_query_length = decoder_input_shape[-1]
+        key_length = past_length + decoder_query_length
+        decoder_self_attention_mask = self.bias[None, key_length - decoder_query_length : key_length, :key_length]
+
+        if decoder_attention_mask is not None:
+            decoder_self_attention_mask = decoder_self_attention_mask * decoder_attention_mask.view(batch_size, 1, -1).to(
+                dtype=torch.bool, device=decoder_self_attention_mask.device
+            )
+
+        # MQA models: (batch_size, query_length, n_heads, key_length)
+        # MHA models: (batch_size, n_heads, query_length, key_length)
+        decoder_attention_mask = decoder_self_attention_mask.unsqueeze(2 if self.multi_query else 1)
+        cross_attention_mask = cross_attention_mask.unsqueeze(2 if self.multi_query else 1)
+
+        # Prepare head mask if needed
+        # 1.0 in head_mask indicate we keep the head
+        # attention_probs has shape bsz x n_heads x N x N
+        # head_mask has shape n_layer x batch x n_heads x N x N
+        decoder_head_mask = self.get_head_mask(head_mask, self.config.num_decoder_layers)
+        cross_attn_head_mask = self.get_head_mask(cross_attn_head_mask, self.config.num_decoder_layers)
+
+        if decoder_inputs_embeds is None:
+            decoder_inputs_embeds = self.wte(decoder_input_ids)
+        position_embeds = self.wpe(position_ids)
+        decoder_hidden_states = decoder_inputs_embeds + position_embeds
+
 
         decoder_inputs_embeds = self.wte(decoder_input_ids)
         decoder_position_embeds = self.wpe(decoder_position_ids)
@@ -692,6 +767,9 @@ class StackT5Model(StackT5PreTrainedModel):
         decoder_output_shape = decoder_input_shape + (decoder_hidden_states.size(-1),)
 
         presents = [] if use_cache else None
+        all_self_attentions = () if output_attentions else None
+        all_cross_attentions = () if output_attentions and self.config.add_cross_attention else None
+        all_hidden_states = () if output_hidden_states else None
 
         for i, (block, layer_past) in enumerate(zip(self.decoder, past_key_values)):
             if output_hidden_states:
@@ -708,21 +786,22 @@ class StackT5Model(StackT5PreTrainedModel):
 
                 outputs = torch.utils.checkpoint.checkpoint(
                     create_custom_forward(block),
-                    hidden_states,
+                    decoder_hidden_states,
                     None,
                     attention_mask,
                     decoder_head_mask[i],
-                    hidden_states,
-                    attention_mask,
+                    encoder_hidden_states,
+                    encoder_attention_mask,
                 )
             else:
                 outputs = block(
-                    hidden_states,
+                    decoder_hidden_states,
                     layer_past=layer_past,
-                    attention_mask=attention_mask,
+                    attention_mask=decoder_attention_mask,
                     head_mask=decoder_head_mask[i],
-                    encoder_hidden_states=hidden_states,
-                    encoder_attention_mask=attention_mask,
+                    cross_attn_head_mask=cross_attn_head_mask[i],
+                    encoder_hidden_states=encoder_hidden_states,
+                    encoder_attention_mask=cross_attention_mask,
                     use_cache=use_cache,
                     output_attentions=output_attentions,
                 )
@@ -743,40 +822,90 @@ class StackT5Model(StackT5PreTrainedModel):
         if output_hidden_states:
             all_hidden_states = all_hidden_states + (decoder_hidden_states,)
 
-        if not return_dict:
-            return tuple(
-                v
-                for v in [decoder_hidden_states, presents, all_hidden_states, all_self_attentions, all_cross_attentions]
-                if v is not None
-            )
-
-        if all_hidden_states is not None:
-            splitting_idx = len(all_hidden_states)//2
-            all_encoder_hidden_states = all_hidden_states[:splitting_idx]
-            all_decoder_hidden_states = all_hidden_states[splitting_idx:]
-        else:
-            all_encoder_hidden_states = None
-            all_decoder_hidden_states = None
-            
-        
-        if all_self_attentions is not None:
-            splitting_idx = len(all_self_attentions)//2
-            all_encoder_attentions = all_self_attentions[:splitting_idx]
-            all_decoder_attentions = all_self_attentions[splitting_idx:]
-        else:
-            all_encoder_attentions = None
-            all_decoder_attentions = None
-
-        return Seq2SeqModelOutput(
+        if return_dict is None or return_dict:
+            return BaseModelOutputWithPastAndCrossAttentions(
             last_hidden_state=decoder_hidden_states,
             past_key_values=presents,
-            decoder_hidden_states=all_decoder_hidden_states,
-            decoder_attentions=all_decoder_attentions,
+            hidden_states=all_hidden_states,
+            attentions=all_self_attentions,
             cross_attentions=all_cross_attentions,
-            encoder_last_hidden_state=hidden_states,
-            encoder_hidden_states=all_encoder_hidden_states,
-            encoder_attentions=all_encoder_attentions,
         )
+
+        return tuple(
+            v
+            for v in [decoder_hidden_states, presents, all_hidden_states, all_self_attentions, all_cross_attentions]
+            if v is not None
+        )
+
+    @add_start_docstrings_to_model_forward(STACKT5_INPUTS_DOCSTRING)
+    def forward(
+            self,
+            input_ids: Optional[torch.Tensor] = None,
+            attention_mask: Optional[torch.Tensor] = None,
+            decoder_input_ids: Optional[torch.Tensor] = None,
+            decoder_attention_mask: Optional[torch.Tensor] = None,
+            past_key_values: Optional[List[torch.Tensor]] = None,
+            encoder_outputs: Optional[Tuple[Tuple[torch.Tensor]]] = None,
+            head_mask: Optional[torch.Tensor] = None,
+            decoder_head_mask: Optional[torch.Tensor] = None,
+            cross_attn_head_mask: Optional[torch.Tensor] = None,
+            inputs_embeds: Optional[torch.Tensor] = None,
+            decoder_inputs_embeds: Optional[torch.Tensor] = None,
+            use_cache: Optional[bool] = None,
+            output_attentions: Optional[bool] = None,
+            output_hidden_states: Optional[bool] = None,
+            return_dict: Optional[bool] = None,
+        ) -> Union[Tuple, Seq2SeqModelOutput]:
+
+
+        if encoder_outputs is None:
+            encoder_out = self.encoder_forward(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                head_mask=head_mask,
+                inputs_embeds=inputs_embeds,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+            )
+        else:
+            encoder_out = encoder_outputs
+
+
+        if return_dict is None or return_dict:
+            encoder_hidden_states = encoder_out.last_hidden_state
+        else:
+            encoder_hidden_states = encoder_out[0]
+
+
+        decoder_out = self.decoder_forward(
+            input_ids=decoder_input_ids,
+            attention_mask=decoder_attention_mask,
+            head_mask=decoder_head_mask,
+            cross_attn_head_mask=cross_attn_head_mask,
+            inputs_embeds=decoder_inputs_embeds,
+            past_key_values=past_key_values,
+            encoder_hidden_states=encoder_hidden_states,
+            encoder_attention_mask=attention_mask,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            use_cache=use_cache,
+            return_dict=return_dict,
+        )
+
+        if return_dict is None or return_dict:
+            return Seq2SeqModelOutput(
+                last_hidden_state=decoder_out.last_hidden_state,
+                past_key_values=decoder_out.past_key_values,
+                decoder_hidden_states=decoder_out.hidden_states,
+                decoder_attentions=decoder_out.attentions,
+                cross_attentions=decoder_out.cross_attentions,
+                encoder_last_hidden_state=encoder_out.last_hidden_state,
+                encoder_hidden_states=encoder_out.hidden_states,
+                encoder_attentions=encoder_out.attentions,
+            )
+    
+        return decoder_out + encoder_out
 
 
 @add_start_docstrings("""StackT5 Model with a `language modeling` head on top.""", STACKT5_START_DOCSTRING)
@@ -798,43 +927,6 @@ class StackT5ForConditionalGeneration(StackT5PreTrainedModel):
     def set_output_embeddings(self, new_embeddings):
         self.lm_head = new_embeddings
 
-    def prepare_inputs_for_generation(self, input_ids, past_key_values=None, inputs_embeds=None, **kwargs):
-        token_type_ids = kwargs.get("token_type_ids", None)
-        # only last token for inputs_ids if past is defined in kwargs
-        if past_key_values:
-            input_ids = input_ids[:, -1].unsqueeze(-1)
-            if token_type_ids is not None:
-                token_type_ids = token_type_ids[:, -1].unsqueeze(-1)
-
-        attention_mask = kwargs.get("attention_mask", None)
-        position_ids = kwargs.get("position_ids", None)
-
-        if attention_mask is not None and position_ids is None:
-            # create position_ids on the fly for batch generation
-            position_ids = attention_mask.long().cumsum(-1) - 1
-            position_ids.masked_fill_(attention_mask == 0, 1)
-            if past_key_values:
-                position_ids = position_ids[:, -1].unsqueeze(-1)
-        else:
-            position_ids = None
-
-        # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
-        if inputs_embeds is not None and past_key_values is None:
-            model_inputs = {"inputs_embeds": inputs_embeds}
-        else:
-            model_inputs = {"input_ids": input_ids}
-
-        model_inputs.update(
-            {
-                "past_key_values": past_key_values,
-                "use_cache": kwargs.get("use_cache"),
-                "position_ids": position_ids,
-                "attention_mask": attention_mask,
-                "token_type_ids": token_type_ids,
-            }
-        )
-        return model_inputs
-
     @add_start_docstrings_to_model_forward(STACKT5_INPUTS_DOCSTRING)
     def forward(
         self,
@@ -843,7 +935,10 @@ class StackT5ForConditionalGeneration(StackT5PreTrainedModel):
         decoder_input_ids: Optional[torch.Tensor] = None,
         decoder_attention_mask: Optional[torch.Tensor] = None,
         past_key_values: Optional[List[torch.Tensor]] = None,
+        encoder_outputs: Optional[Tuple[Tuple[torch.Tensor]]] = None,
         head_mask: Optional[torch.Tensor] = None,
+        decoder_head_mask: Optional[torch.Tensor] = None,
+        cross_attn_head_mask: Optional[torch.Tensor] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
         use_cache: Optional[bool] = None,
@@ -868,15 +963,21 @@ class StackT5ForConditionalGeneration(StackT5PreTrainedModel):
             decoder_input_ids=decoder_input_ids,
             decoder_attention_mask=decoder_attention_mask,
             past_key_values=past_key_values,
+            encoder_outputs=encoder_outputs,
             attention_mask=attention_mask,
             head_mask=head_mask,
+            decoder_head_mask=decoder_head_mask,
+            cross_attn_head_mask=cross_attn_head_mask,
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
         )
-        hidden_states = transformer_outputs[0]
+        if return_dict is None or return_dict:
+            hidden_states = transformer_outputs.last_hidden_state
+        else:
+            hidden_states = transformer_outputs[0]
 
         lm_logits = self.lm_head(hidden_states)
 
@@ -889,23 +990,23 @@ class StackT5ForConditionalGeneration(StackT5PreTrainedModel):
             loss_fct = CrossEntropyLoss()
             loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
 
-        if not return_dict:
-            output = (lm_logits,) + transformer_outputs[1:]
-            return ((loss,) + output) if loss is not None else output
+        if return_dict is None or return_dict:
+            return Seq2SeqLMOutput(
+                loss=loss,
+                logits=lm_logits,
+                past_key_values=transformer_outputs.past_key_values,
+                decoder_hidden_states=transformer_outputs.decoder_hidden_states,
+                decoder_attentions=transformer_outputs.decoder_attentions,
+                cross_attentions=transformer_outputs.cross_attentions,
+                encoder_last_hidden_state=transformer_outputs.encoder_last_hidden_state,
+                encoder_hidden_states=transformer_outputs.encoder_hidden_states,
+                encoder_attentions=transformer_outputs.encoder_attentions,
+            )
+        
+        output = (lm_logits,) + transformer_outputs[1:]
+        return ((loss,) + output) if loss is not None else output
+
     
-        return Seq2SeqLMOutput(
-            loss=loss,
-            logits=lm_logits,
-            past_key_values=transformer_outputs.past_key_values,
-            decoder_hidden_states=transformer_outputs.decoder_hidden_states,
-            decoder_attentions=transformer_outputs.decoder_attentions,
-            cross_attentions=transformer_outputs.cross_attentions,
-            encoder_last_hidden_state=transformer_outputs.encoder_last_hidden_state,
-            encoder_hidden_states=transformer_outputs.encoder_hidden_states,
-            encoder_attentions=transformer_outputs.encoder_attentions,
-        )
-
-
     def prepare_inputs_for_generation(
         self,
         input_ids,
@@ -967,3 +1068,27 @@ class StackT5ForConditionalGeneration(StackT5PreTrainedModel):
 
             reordered_decoder_past = reordered_decoder_past + (reordered_layer_past_states,)
         return reordered_decoder_past
+
+    def get_encoder(self):
+        return AuxiliaryModel(is_encoder=True, base_model=self)
+
+    def get_decoder(self):
+        return AuxiliaryModel(is_encoder=False, base_model=self)
+
+    
+
+class AuxiliaryModel():
+    def __init__(self, is_encoder: bool, base_model: StackT5ForConditionalGeneration):
+
+        self.base_model = base_model
+        self.is_encoder = is_encoder
+        self.is_encoder_decoder = False
+    
+    def forward(self, **kwargs):
+        if self.is_encoder:
+            return self.base_model.transformer.encoder_forward(**kwargs)
+        else:
+            return self.base_model.transformer.decoder_forward(**kwargs)
+    
+    def __call__(self, **kwargs):
+        return self.forward(**kwargs)
