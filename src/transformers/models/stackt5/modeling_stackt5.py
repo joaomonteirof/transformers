@@ -101,7 +101,7 @@ class StackT5Attention(nn.Module):
         self.scale_attn_weights = config.scale_attn_weights
         self.is_cross_attention = is_cross_attention
 
-        self.layer_idx = layer_idx
+        self.layer_idx = max(1, layer_idx)
         self.attention_softmax_in_fp32 = config.attention_softmax_in_fp32
         self.scale_attention_softmax_in_fp32 = (
             config.scale_attention_softmax_in_fp32 and config.attention_softmax_in_fp32
@@ -117,7 +117,10 @@ class StackT5Attention(nn.Module):
     def _get_mask_value(self, device, dtype):
         # torch.where expects a tensor. We use a cache to avoid recreating it every time.
         if self.mask_value is None or self.mask_value.dtype != dtype or self.mask_value.device != device:
-            self.mask_value = torch.full([], torch.finfo(dtype).min, dtype=dtype, device=device)
+            # this was originally:
+            ## self.mask_value = torch.full([], torch.finfo(dtype).min, dtype=dtype, device=device)
+            # We used the -10000.0 instead to replicate what is done in Megatron.
+            self.mask_value = torch.full([], -10000.0, dtype=dtype, device=device)
         return self.mask_value
 
     def _attn(self, query, key, value, attention_mask=None, head_mask=None):
@@ -125,8 +128,8 @@ class StackT5Attention(nn.Module):
         softmax_dtype = torch.float32 if self.attention_softmax_in_fp32 else dtype
         upcast = dtype != softmax_dtype
 
-        unscale = self.layer_idx + 1 if self.scale_attention_softmax_in_fp32 and upcast else 1
-        scale_factor = unscale**-1
+        unscale = self.layer_idx
+        scale_factor = self.layer_idx**-1
         if self.scale_attn_weights:
             scale_factor /= self.kv_channels**0.5
 
@@ -140,7 +143,7 @@ class StackT5Attention(nn.Module):
         attn_shape = (batch_size, query_length, self.num_heads, key_length)
         attn_view = (batch_size, query_length * self.num_heads, key_length)
         # No copy needed for MQA 2, or when layer_past is provided.
-        query = query.reshape(batch_size, query_length * self.num_heads, self.kv_channels)
+        query = query.view(batch_size, query_length * self.num_heads, self.kv_channels)
 
         attn_weights = torch.empty(attn_view, device=query.device, dtype=query.dtype)
         if query.device.type == "cpu":
@@ -151,6 +154,7 @@ class StackT5Attention(nn.Module):
             beta = 1
         else:
             beta = 0
+
         attn_weights = torch.baddbmm(attn_weights, query, key, beta=beta, alpha=scale_factor).view(attn_shape)
 
         if upcast:
@@ -162,6 +166,7 @@ class StackT5Attention(nn.Module):
                 mask_value = self._get_mask_value(attn_weights.device, softmax_dtype)
                 attn_weights = upcast_masked_softmax(attn_weights, attention_mask, mask_value, unscale, softmax_dtype)
         else:
+            attn_weights *= unscale
             if attention_mask is not None:
                 mask_value = self._get_mask_value(attn_weights.device, softmax_dtype)
 
@@ -181,8 +186,6 @@ class StackT5Attention(nn.Module):
         attn_output = torch.bmm(attn_weights.view(attn_view), value).view(query_shape)
 
         return attn_output, attn_weights
-
-    
 
     def forward(
         self,
@@ -278,6 +281,7 @@ class StackT5Block(nn.Module):
     ]:
         residual = hidden_states
         hidden_states = self.ln_1(hidden_states)
+
         attn_outputs = self.attn(
             hidden_states,
             layer_past=layer_past,
@@ -288,12 +292,14 @@ class StackT5Block(nn.Module):
         )
         attn_output = attn_outputs[0]  # output_attn: a, present, (attentions)
         outputs = attn_outputs[1:]
+        
         # residual connection
         hidden_states = attn_output + residual
 
+        residual = hidden_states
+        hidden_states = self.ln_2(hidden_states)
+
         if self.is_decoder:
-            residual = hidden_states
-            hidden_states = self.ln_cross_attn(hidden_states)
             cross_attn_outputs = self.crossattention(
                 hidden_states,
                 attention_mask=None,
@@ -302,13 +308,16 @@ class StackT5Block(nn.Module):
                 encoder_attention_mask=encoder_attention_mask,
                 output_attentions=output_attentions,
             )
+    
             attn_output = cross_attn_outputs[0]
+
             # residual connection
-            hidden_states = residual + self.ln_cross_attn(attn_output)
+            hidden_states = residual + attn_output
+
+            residual = hidden_states
+            hidden_states = self.ln_cross_attn(hidden_states)
             outputs = outputs + cross_attn_outputs[2:]  # add cross attentions if we output attention weights
 
-        residual = hidden_states
-        hidden_states = self.ln_2(hidden_states)
         feed_forward_hidden_states = self.mlp(hidden_states)
         # residual connection
         hidden_states = residual + feed_forward_hidden_states
@@ -490,14 +499,17 @@ class StackT5Model(StackT5PreTrainedModel):
         self.wpe = nn.Embedding(config.max_position_embeddings, self.embed_dim)
 
         self.drop = nn.Dropout(config.embd_pdrop)
-        self.encoder = nn.ModuleList([StackT5Block(config, is_decoder=False, layer_idx=i) for i in range(config.num_encoder_layers)])
+        self.encoder = nn.ModuleList([StackT5Block(config, is_decoder=False, layer_idx=i+1) for i in range(config.num_encoder_layers)])
         self.encoder_ln_f = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_epsilon)
-        self.decoder = nn.ModuleList([StackT5Block(config, is_decoder=True, layer_idx=i) for i in range(config.num_decoder_layers)])
+        self.decoder = nn.ModuleList([StackT5Block(config, is_decoder=True, layer_idx=i+1) for i in range(config.num_decoder_layers)])
         self.decoder_ln_f = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_epsilon)
 
         max_positions = config.max_position_embeddings
         self.register_buffer(
-            "bias", torch.tril(torch.ones((max_positions, max_positions), dtype=torch.bool)), persistent=False
+            "decoder_bias", torch.tril(torch.ones((max_positions, max_positions), dtype=torch.bool)), persistent=False
+        )
+        self.register_buffer(
+            "encoder_bias", torch.ones((max_positions, max_positions), dtype=torch.bool), persistent=False
         )
 
         self.gradient_checkpointing = False
@@ -555,7 +567,7 @@ class StackT5Model(StackT5PreTrainedModel):
 
         # Encoder self-attention mask and cross-attention mask.
         query_length = input_shape[-1]
-        self_attention_mask = self.bias[None, :query_length, :query_length]
+        self_attention_mask = self.encoder_bias[None, :query_length, :query_length]
 
         if attention_mask is not None:
             self_attention_mask = self_attention_mask * attention_mask.view(batch_size, 1, -1).to(
@@ -723,7 +735,7 @@ class StackT5Model(StackT5PreTrainedModel):
         # Cross-attention mask.
         encoder_input_length = encoder_hidden_states.size(1)
         decoder_query_length = decoder_input_shape[-1]
-        cross_attention_mask = self.bias[None, :decoder_query_length, :encoder_input_length]
+        cross_attention_mask = self.encoder_bias[None, :decoder_query_length, :encoder_input_length]
 
         if encoder_attention_mask is not None:
             cross_attention_mask = cross_attention_mask * encoder_attention_mask.view(batch_size, 1, -1).to(
@@ -733,7 +745,7 @@ class StackT5Model(StackT5PreTrainedModel):
         # Decoder self-attention mask.
         decoder_query_length = decoder_input_shape[-1]
         key_length = past_length + decoder_query_length
-        decoder_self_attention_mask = self.bias[None, key_length - decoder_query_length : key_length, :key_length]
+        decoder_self_attention_mask = self.decoder_bias[None, key_length - decoder_query_length : key_length, :key_length]
 
         if decoder_attention_mask is not None:
             decoder_self_attention_mask = decoder_self_attention_mask * decoder_attention_mask.view(batch_size, 1, -1).to(
@@ -815,6 +827,7 @@ class StackT5Model(StackT5PreTrainedModel):
                 if self.config.add_cross_attention:
                     all_cross_attentions = all_cross_attentions + (outputs[3 if use_cache else 2],)
 
+
         decoder_hidden_states = self.decoder_ln_f(decoder_hidden_states)
 
         decoder_hidden_states = decoder_hidden_states.view(decoder_output_shape)
@@ -876,7 +889,6 @@ class StackT5Model(StackT5PreTrainedModel):
             encoder_hidden_states = encoder_out.last_hidden_state
         else:
             encoder_hidden_states = encoder_out[0]
-
 
         decoder_out = self.decoder_forward(
             input_ids=decoder_input_ids,
